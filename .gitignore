@@ -1,0 +1,25 @@
+# Byte-compiled / cache files
+__pycache__/
+*.py[cod]
+
+# Virtual environments
+venv/
+.venv/
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# Python tooling
+.pytest_cache/
+.mypy_cache/
+
+# Streamlit
+.streamlit/
+    
+# Docker artifacts
+*.pyc
+*.pyo
+
+# MD artifacts
+md/
