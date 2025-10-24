@@ -90,12 +90,33 @@ class AgentClient:
         self._parser = _JsonArrayParser()
 
     # Session management ---------------------------------------------------------
-    def ensure_connected(self) -> None:
+    def ensure_connected(self, progress_cb: Optional[ProgressCallback] = None) -> None:
+        t0 = time.perf_counter()
+        prev = self._ssh.channel
         channel = self._ssh.ensure_channel()
+        t1 = time.perf_counter()
+        elapsed_ms = int((t1 - t0) * 1000)
+        # Only trace when channel was created/refreshed or took noticeable time
+        if prev is None or getattr(prev, "closed", True) or (prev is not channel) or elapsed_ms > 5:
+            self._trace(progress_cb, "SSH channel ready", {
+                "elapsed_ms": elapsed_ms,
+            })
+
         if not self._session.banner:
+            t2 = time.perf_counter()
             self._session.banner = self._drain_banner(channel)
+            t3 = time.perf_counter()
+            self._trace(progress_cb, "Drained banner", {
+                "elapsed_ms": int((t3 - t2) * 1000),
+                "size": len(self._session.banner or ""),
+            })
         if not self._session.initialized:
-            self._initialize_session(channel)
+            t4 = time.perf_counter()
+            self._initialize_session(channel, progress_cb)
+            t5 = time.perf_counter()
+            self._trace(progress_cb, "Initialized agent session", {
+                "elapsed_ms": int((t5 - t4) * 1000),
+            })
 
     def disconnect(self) -> None:
         self._ssh.close()
@@ -113,7 +134,7 @@ class AgentClient:
         """
         Execute a single agent command and return the structured result.
         """
-        self.ensure_connected()
+        self.ensure_connected(progress_cb)
         channel = self._get_channel()
 
         result = CommandResult(command=command, success=False)
@@ -193,26 +214,41 @@ class AgentClient:
             self._parser.reset()
 
     # Helpers --------------------------------------------------------------------
-    def _initialize_session(self, channel: paramiko.Channel) -> None:
-        for command in (
-            "options set --output-format=json",
-            "options set --notify-progress=yes",
-            "options set --show-prompt=no",
-        ):
-            channel.send(command + "\n")
-            time.sleep(0.2)
-            self._drain_channel(channel)
+    def _initialize_session(self, channel: paramiko.Channel, progress_cb: Optional[ProgressCallback] = None) -> None:
+        command = (
+            "options set "
+            "--output-format=json "
+            "--notify-progress=yes "
+            "--show-prompt=no"
+        )
+        t0 = time.perf_counter()
+        channel.send(command + "\n")
+        # Drain output until the channel becomes quiet to avoid fixed sleeps
+        drained = self._drain_until_quiet(channel, quiet_time=0.1, max_time=0.8)
+        t1 = time.perf_counter()
+        self._trace(progress_cb, "Init step", {
+            "command": command,
+            "elapsed_ms": int((t1 - t0) * 1000),
+            "size": len(drained),
+        })
         self._session.initialized = True
 
     def _drain_banner(self, channel: paramiko.Channel) -> str:
-        banner = []
-        start = time.time()
-        while time.time() - start < 1.5:
+        banner: list[str] = []
+        start = time.perf_counter()
+        last_data = start
+        max_time = 1.0
+        quiet_time = 0.2
+        while (time.perf_counter() - start) < max_time:
             if channel.recv_ready():
                 chunk = channel.recv(4096).decode("utf-8", errors="ignore")
-                banner.append(chunk)
+                if chunk:
+                    banner.append(chunk)
+                    last_data = time.perf_counter()
             else:
-                time.sleep(0.1)
+                if (time.perf_counter() - last_data) >= quiet_time:
+                    break
+                time.sleep(0.05)
         return "".join(banner)
 
     def _drain_channel(self, channel: paramiko.Channel) -> None:
@@ -228,3 +264,35 @@ class AgentClient:
         if not channel or channel.closed:
             raise SSHConnectionError("SSH channel is not available.")
         return channel
+
+    # ----------------------------------------------------------------------------
+    def _drain_until_quiet(self, channel: paramiko.Channel, *, quiet_time: float = 0.1, max_time: float = 0.6) -> str:
+        """Read from channel until no data arrives for quiet_time or max_time passes."""
+        start = time.perf_counter()
+        last_data = start
+        chunks: list[str] = []
+        while (time.perf_counter() - start) < max_time:
+            if channel.recv_ready():
+                chunk = channel.recv(4096).decode("utf-8", errors="ignore")
+                if chunk:
+                    chunks.append(chunk)
+                    last_data = time.perf_counter()
+            else:
+                if (time.perf_counter() - last_data) >= quiet_time:
+                    break
+                time.sleep(0.05)
+        return "".join(chunks)
+
+    def _trace(self, progress_cb: Optional[ProgressCallback], title: str, data: Optional[dict] = None) -> None:
+        import os
+        if not progress_cb:
+            return
+        # Enable via env var to avoid noisy logs by default
+        if os.getenv("ONEC_AGENT_UI_DEBUG_TRACE", "").lower() not in {"1", "true", "yes"}:
+            return
+        try:
+            message = CommandMessage(type="log", title=f"[client] {title}", data=data)
+            progress_cb("[client]", message)
+        except Exception:
+            # Do not let tracing affect execution
+            pass

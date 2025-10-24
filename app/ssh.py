@@ -104,8 +104,8 @@ class SSHConnectionManager:
         except (paramiko.SSHException, socket.error) as exc:
             raise SSHConnectionError(f"Failed to open agent shell: {exc}") from exc
 
-        # Allow agent to initialize before commands are sent.
-        time.sleep(1.0)
+        # Do not introduce a fixed delay here; banner draining in AgentClient
+        # will wait just enough for initial output.
         self._channel = channel
         return channel
 
