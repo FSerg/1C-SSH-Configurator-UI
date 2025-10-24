@@ -109,6 +109,8 @@ class StreamlitApp:
             st.rerun()
 
         if selected_uid:
+            if st.sidebar.button("Скопировать проект"):
+                self._copy_project_to_form(selected_uid)
             if st.sidebar.button("Удалить проект"):
                 project = self.storage.get_project(selected_uid)
                 display_name = project.name if project else selected_uid
@@ -815,6 +817,27 @@ class StreamlitApp:
             "extensions": join_multiline(project.extensions),
             "external_objects": join_multiline(project.external_objects),
         }
+
+    def _copy_project_to_form(self, uid: str) -> None:
+        """Скопировать выбранный проект в форму для создания нового проекта."""
+        project = self.storage.get_project(uid)
+        if not project:
+            st.sidebar.error("Проект не найден.")
+            return
+        
+        # Создаём копию данных формы
+        form_data = self._project_to_form(project)
+        
+        # Обнуляем uid для создания нового проекта
+        form_data["uid"] = None
+        
+        # Добавляем суффикс " (копия)" к имени
+        form_data["name"] = f"{project.name} (копия)"
+        
+        # Переключаемся в режим создания нового проекта
+        st.session_state.selected_project_uid = None
+        st.session_state.project_form_data = form_data
+        st.rerun()
 
     def _current_project(self) -> Optional[ProjectModel]:
         uid = st.session_state.get("selected_project_uid")
