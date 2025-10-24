@@ -4,7 +4,7 @@ Pydantic models that define configuration and runtime entities.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import List, Optional
 from uuid import uuid4
 
@@ -62,8 +62,8 @@ class ProjectModel(BaseModel):
     extensions: List[str] = Field(default_factory=list, description="List of extension names to process.")
     external_objects: List[str] = Field(default_factory=list, description="List of external reports/processors.")
     options: RunOptionsModel = Field(default_factory=RunOptionsModel)
-    created_at: datetime = Field(default_factory=datetime.utcnow)
-    updated_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     auto_connect: bool = Field(False, description="Automatically connect on project selection.")
 
     @validator(
@@ -90,14 +90,14 @@ class ProjectModel(BaseModel):
 
     @validator("created_at", "updated_at", pre=True, always=True, allow_reuse=True)
     def _ensure_datetime(cls, value):
-        return value or datetime.utcnow()
+        return value or datetime.now(UTC)
 
     def touch(self) -> "ProjectModel":
         """
         Return a copy of the project with an updated timestamp.
         """
         updated = self.copy()
-        updated.updated_at = datetime.utcnow()
+        updated.updated_at = datetime.now(UTC)
         return updated
 
 
@@ -112,8 +112,8 @@ class CommandResult(BaseModel):
     command: str
     success: bool
     messages: List[CommandMessage] = Field(default_factory=list)
-    started_at: datetime = Field(default_factory=datetime.utcnow)
+    started_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     finished_at: datetime | None = None
 
     def mark_finished(self) -> None:
-        self.finished_at = datetime.utcnow()
+        self.finished_at = datetime.now(UTC)
