@@ -143,7 +143,15 @@ class StreamlitApp:
         with st.form("project_form"):
             col1, col2 = st.columns(2)
             with col1:
-                name = st.text_input("Имя проекта", value=data["name"])
+                name_col, uid_col = st.columns((3, 2))
+                with name_col:
+                    name = st.text_input("Имя проекта", value=data["name"])
+                with uid_col:
+                    st.text_input(
+                        "UID проекта",
+                        value=(data.get("uid") or "—"),
+                        disabled=True,
+                    )
                 host = st.text_input("SSH хост", value=data["host"])
                 port = st.number_input("SSH порт", min_value=1, max_value=65535, value=int(data["port"]))
                 username = st.text_input("SSH пользователь", value=data["username"])
