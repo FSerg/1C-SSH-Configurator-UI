@@ -78,6 +78,14 @@ class ProjectStorage:
             self._save()
             return renamed.copy(deep=True)
 
+    def reload(self) -> None:
+        """
+        Reload the storage contents from disk.
+        """
+        with self._lock:
+            self._projects.clear()
+            self._load()
+
     # Internal helpers -----------------------------------------------------------
     def _load(self) -> None:
         if not self.path.exists():

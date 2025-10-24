@@ -2,10 +2,10 @@ services:
   streamlit-app:
     build: .
     ports:
-      - "8502:8501"
+      - "8000:8000"
+      - "8501:8501"
     volumes:
       - 1c-agent-ui:/root/.1c-agent-ui
-    command: /bin/sh -c "streamlit run streamlit_app.py --server.address=0.0.0.0 --server.port=8501"
     restart: unless-stopped
 
 volumes:

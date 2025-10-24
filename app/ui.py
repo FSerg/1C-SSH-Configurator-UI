@@ -4,7 +4,6 @@ Streamlit UI composition for the 1C agent controller.
 
 from __future__ import annotations
 
-import posixpath
 from dataclasses import dataclass
 from typing import Iterable, List, Optional
 
@@ -16,6 +15,14 @@ from pydantic import ValidationError
 
 from .agent_client import AgentClient
 from .models import CommandMessage, ProjectModel, RunOptionsModel
+from .operations import (
+    build_dump_config_sequence,
+    build_dump_extensions_sequence,
+    build_dump_externals_sequence,
+    build_load_config_sequence,
+    build_load_extensions_sequence,
+    build_load_externals_sequence,
+)
 from .storage import ProjectStorage
 from .utils import clean_multiline_input, join_multiline
 
@@ -143,7 +150,15 @@ class StreamlitApp:
         with st.form("project_form"):
             col1, col2 = st.columns(2)
             with col1:
-                name = st.text_input("Имя проекта", value=data["name"])
+                name_col, uid_col = st.columns((3, 2))
+                with name_col:
+                    name = st.text_input("Имя проекта", value=data["name"])
+                with uid_col:
+                    st.text_input(
+                        "UID проекта",
+                        value=(data.get("uid") or "—"),
+                        disabled=True,
+                    )
                 host = st.text_input("SSH хост", value=data["host"])
                 port = st.number_input("SSH порт", min_value=1, max_value=65535, value=int(data["port"]))
                 username = st.text_input("SSH пользователь", value=data["username"])
@@ -258,7 +273,7 @@ class StreamlitApp:
         col_dump, col_load = st.columns(2)
         with col_dump:
             if st.button("Выгрузить конфигурацию", disabled=self._is_operation_running()):
-                commands = self._build_dump_config_sequence(project)
+                commands = build_dump_config_sequence(project)
                 self._queue_operation(
                     project,
                     "Выгрузка конфигурации",
@@ -268,7 +283,7 @@ class StreamlitApp:
                 )
         with col_load:
             if st.button("Загрузить конфигурацию", disabled=self._is_operation_running()):
-                commands = self._build_load_config_sequence(project)
+                commands = build_load_config_sequence(project)
                 self._queue_operation(
                     project,
                     "Загрузка конфигурации",
@@ -293,7 +308,7 @@ class StreamlitApp:
         col_dump, col_load = st.columns(2)
         with col_dump:
             if st.button("Выгрузить расширения", disabled=self._is_operation_running()):
-                commands = self._build_dump_extensions_sequence(project)
+                commands = build_dump_extensions_sequence(project)
                 self._queue_operation(
                     project,
                     "Выгрузка расширений",
@@ -303,7 +318,7 @@ class StreamlitApp:
                 )
         with col_load:
             if st.button("Загрузить расширения", disabled=self._is_operation_running()):
-                commands = self._build_load_extensions_sequence(project)
+                commands = build_load_extensions_sequence(project)
                 self._queue_operation(
                     project,
                     "Загрузка расширений",
@@ -331,7 +346,7 @@ class StreamlitApp:
                 if not project.external_objects:
                     st.warning("Список внешних файлов пуст. Укажите имена файлов в проекте.")
                 else:
-                    commands = self._build_dump_externals_sequence(project)
+                    commands = build_dump_externals_sequence(project)
                     self._queue_operation(
                         project,
                         "Выгрузка внешних файлов",
@@ -344,7 +359,7 @@ class StreamlitApp:
                 if not project.external_objects:
                     st.warning("Список внешних файлов пуст. Укажите имена файлов в проекте.")
                 else:
-                    commands = self._build_load_externals_sequence(project)
+                    commands = build_load_externals_sequence(project)
                     self._queue_operation(
                         project,
                         "Загрузка внешних файлов",
@@ -560,130 +575,6 @@ class StreamlitApp:
                 detail_parts.append(str(message.data))
         detail = " | ".join(part for part in detail_parts if part)
         return f"{headline} -> {detail}" if detail else headline
-
-    # ------------------------------------------------------------- command utils
-    def _build_dump_config_sequence(self, project: ProjectModel) -> List[str]:
-        command = self._build_config_command(
-            "dump-config-to-files",
-            project.config_dir,
-            project.options,
-            allow_dump_flags=True,
-            allow_server_flags=True,
-        )
-        return ["common connect-ib", command, "common disconnect-ib"]
-
-    def _build_load_config_sequence(self, project: ProjectModel) -> List[str]:
-        command = self._build_config_command(
-            "load-config-from-files",
-            project.config_dir,
-            project.options,
-            load=True,
-            allow_load_flags=True,
-        )
-        sequence = ["common connect-ib", command, "common disconnect-ib"]
-        return sequence
-
-    def _build_dump_extensions_sequence(self, project: ProjectModel) -> List[str]:
-        commands = ["common connect-ib"]
-        if project.extensions:
-            for name in project.extensions:
-                per_extension_command = self._build_config_command(
-                    "dump-config-to-files",
-                    self._join_remote(project.extensions_dir, name),
-                    project.options,
-                )
-                command = f'{per_extension_command} --extension="{name}"'
-                commands.append(command)
-        else:
-            base = self._build_config_command(
-                "dump-config-to-files",
-                project.extensions_dir,
-                project.options,
-            )
-            commands.append(f"{base} --all-extensions")
-        commands.append("common disconnect-ib")
-        return commands
-
-    def _build_load_extensions_sequence(self, project: ProjectModel) -> List[str]:
-        commands = ["common connect-ib"]
-        if project.extensions:
-            for name in project.extensions:
-                per_extension_command = self._build_config_command(
-                    "load-config-from-files",
-                    self._join_remote(project.extensions_dir, name),
-                    project.options,
-                    load=True,
-                )
-                command = f'{per_extension_command} --extension="{name}"'
-                commands.append(command)
-        else:
-            base = self._build_config_command(
-                "load-config-from-files",
-                project.extensions_dir,
-                project.options,
-                load=True,
-            )
-            commands.append(f"{base} --all-extensions")
-        commands.append("common disconnect-ib")
-        return commands
-
-    def _build_dump_externals_sequence(self, project: ProjectModel) -> List[str]:
-        commands = ["common connect-ib"]
-        for file_name in project.external_objects:
-            ext_path = self._join_remote(project.externals_dir, file_name)
-            stem = posixpath.splitext(file_name)[0]
-            xml_dir = self._join_remote(project.externals_xml_dir, stem)
-            xml_path = posixpath.join(xml_dir, f"{stem}.xml")
-            commands.append(
-                f'config dump-external-data-processor-or-report-to-files --file="{xml_path}" --ext-file="{ext_path}"'
-            )
-        commands.append("common disconnect-ib")
-        return commands
-
-    def _build_load_externals_sequence(self, project: ProjectModel) -> List[str]:
-        commands = ["common connect-ib"]
-        for file_name in project.external_objects:
-            ext_path = self._join_remote(project.externals_dir, file_name)
-            stem = posixpath.splitext(file_name)[0]
-            xml_dir = self._join_remote(project.externals_xml_dir, stem)
-            xml_path = posixpath.join(xml_dir, f"{stem}.xml")
-            commands.append(
-                f'config load-external-data-processor-or-report-from-files --file="{xml_path}" --ext-file="{ext_path}"'
-            )
-        commands.append("common disconnect-ib")
-        return commands
-
-    def _build_config_command(
-        self,
-        action: str,
-        directory: str,
-        options: RunOptionsModel,
-        load: bool = False,
-        allow_dump_flags: bool = False,
-        allow_load_flags: bool = False,
-        allow_server_flags: bool = False,
-    ) -> str:
-        command = f'config {action} --dir="{directory}"'
-        if not load and allow_dump_flags:
-            if options.update:
-                command += " --update"
-            if options.force:
-                command += " --force"
-            if options.ignore_unresolved_refs:
-                command += " --ignore-unresolved-refs"
-        if load and allow_load_flags:
-            if options.no_check:
-                command += " --no-check"
-            if options.update_config_dump_info:
-                command += " --update-config-dump-info"
-        if allow_server_flags and options.use_server:
-            command += " --server"
-            if options.threads:
-                command += f" --threads={options.threads}"
-        return command
-
-    def _join_remote(self, base: str, name: str) -> str:
-        return str(posixpath.join(base.rstrip("/"), name))
 
     def _is_operation_running(self) -> bool:
         return bool(st.session_state.get("operation_in_progress"))

@@ -14,7 +14,8 @@ RUN pip install --upgrade pip && pip install --no-cache-dir -r requirements.txt
 
 COPY app app
 COPY streamlit_app.py streamlit_app.py
+COPY start_services.py start_services.py
 
-EXPOSE 8501
+EXPOSE 8000 8501
 
-CMD ["streamlit", "run", "streamlit_app.py", "--server.address=0.0.0.0", "--server.port=8501"]
+CMD ["python", "start_services.py"]
