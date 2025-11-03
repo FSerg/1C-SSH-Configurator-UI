@@ -61,6 +61,9 @@ class StorageTestCase(unittest.TestCase):
             assert loaded is not None
             self.assertEqual("secret", loaded.credentials.password)
             self.assertEqual("../config", loaded.config_dir)
+            # Defaults for new fields
+            self.assertIs(False, getattr(loaded, "keep_db_connection", False))
+            self.assertEqual(3600, getattr(loaded, "ssh_idle_timeout_seconds", 3600))
 
             # Rename the project and ensure no duplicates remain
             renamed = saved.copy(update={"name": "Renamed"})

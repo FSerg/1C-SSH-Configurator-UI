@@ -13,7 +13,9 @@ import time
 import streamlit as st
 from pydantic import ValidationError
 
-from .agent_client import AgentClient
+import os
+import requests
+from .session import get_owner as get_session_owner, acquire_owner as acquire_session_owner, release_owner as release_session_owner
 from .models import CommandMessage, ProjectModel, RunOptionsModel
 from .operations import (
     build_dump_config_sequence,
@@ -41,6 +43,8 @@ class StreamlitApp:
 
     def __init__(self, storage: Optional[ProjectStorage] = None) -> None:
         self.storage = storage or ProjectStorage()
+        self._api_base = os.getenv(
+            "ONEC_AGENT_API_BASE", "http://127.0.0.1:8000")
 
     # ---------------------------------------------------------------- rendering
     def run(self) -> None:
@@ -105,7 +109,18 @@ class StreamlitApp:
                     st.rerun()
             elif choice.uid != selected_uid:
                 st.session_state.selected_project_uid = choice.uid
-                st.session_state.project_form_data = self._project_to_form(choice)
+                st.session_state.project_form_data = self._project_to_form(
+                    choice)
+                # Reset last operation summary and clear cached status markers
+                st.session_state.last_operation_result = None
+                try:
+                    # Clear per-project status to force fresh fetch on rerun
+                    st.session_state.pop(self._agent_state_key(choice.uid), None)
+                    key_conn, key_since = self._db_state_keys(choice.uid)
+                    st.session_state.pop(key_conn, None)
+                    st.session_state.pop(key_since, None)
+                except Exception:
+                    pass
                 st.rerun()
         else:
             st.sidebar.info("Проекты не созданы.")
@@ -127,13 +142,45 @@ class StreamlitApp:
                 st.sidebar.success(f"Проект '{display_name}' удален.")
                 st.rerun()
 
-        last_op: Optional[OperationResult] = st.session_state.get("last_operation_result")
+        last_op: Optional[OperationResult] = st.session_state.get(
+            "last_operation_result")
         if last_op:
             st.sidebar.markdown("---")
             status = "[OK]" if last_op.success else "[ERR]"
             st.sidebar.write(f"{status} {last_op.title}")
             if last_op.messages:
                 st.sidebar.write(last_op.messages[-1])
+
+        # DB session status and controls (when enabled for project)
+        selected_uid = st.session_state.get("selected_project_uid")
+        if selected_uid:
+            project = self.storage.get_project(selected_uid)
+            if project and getattr(project, "keep_db_connection", False):
+                st.sidebar.markdown("---")
+                st.sidebar.subheader("Сессия БД")
+                # Pull fresh status from API and update local cache
+                self._refresh_db_status_from_api(project)
+                agent_connected = bool(st.session_state.get(self._agent_state_key(project.uid)))
+                connected, since = self._get_db_session_status(project.uid)
+                # Agent line
+                if agent_connected:
+                    st.sidebar.success("Агент: онлайн")
+                else:
+                    st.sidebar.error("Агент: оффлайн")
+                # DB line
+                if connected:
+                    ts = time.strftime('%Y-%m-%d %H:%M:%S',
+                                       time.localtime(since or time.time()))
+                    st.sidebar.success(f"База: подключено с {ts}")
+                else:
+                    st.sidebar.info("База: не подключено")
+
+                if st.sidebar.button("Подключиться к БД", disabled=self._is_operation_running()):
+                    self._connect_db_now(project)
+                if st.sidebar.button("Отключиться от БД", disabled=self._is_operation_running()):
+                    self._disconnect_db_now(project)
+                if st.sidebar.button("Обновить статус", disabled=self._is_operation_running()):
+                    self._refresh_db_status_from_api(project, force=True)
 
     # --------------------------------------------------------------- tabs: CRUD
     def _render_project_tab(self, projects: List[ProjectModel]) -> None:
@@ -160,25 +207,46 @@ class StreamlitApp:
                         disabled=True,
                     )
                 host = st.text_input("SSH хост", value=data["host"])
-                port = st.number_input("SSH порт", min_value=1, max_value=65535, value=int(data["port"]))
-                username = st.text_input("SSH пользователь", value=data["username"])
-                password = st.text_input("Пароль", value=data["password"], type="password")
-                private_key_path = st.text_input("Путь к приватному ключу (опционально)", value=data["private_key_path"])
-                passphrase = st.text_input("Пароль к ключу (если требуется)", value=data["passphrase"], type="password")
+                port = st.number_input(
+                    "SSH порт", min_value=1, max_value=65535, value=int(data["port"]))
+                username = st.text_input(
+                    "SSH пользователь", value=data["username"])
+                password = st.text_input(
+                    "Пароль", value=data["password"], type="password")
+                private_key_path = st.text_input(
+                    "Путь к приватному ключу (опционально)", value=data["private_key_path"])
+                passphrase = st.text_input(
+                    "Пароль к ключу (если требуется)", value=data["passphrase"], type="password")
             with col2:
-                keepalive = st.number_input("Интервал keep-alive (сек.)", min_value=0, max_value=600, value=int(data["keepalive_interval"]))
-                timeout = st.number_input("Таймаут подключения (сек.)", min_value=5, max_value=300, value=int(data["timeout"]))
-                description = st.text_area("Описание", value=data["description"], height=110)
-                auto_connect = st.checkbox("Автоподключение при выборе проекта", value=data["auto_connect"])
+                keepalive = st.number_input(
+                    "Интервал keep-alive (сек.)", min_value=0, max_value=600, value=int(data["keepalive_interval"]))
+                timeout = st.number_input(
+                    "Таймаут подключения (сек.)", min_value=5, max_value=300, value=int(data["timeout"]))
+                description = st.text_area(
+                    "Описание", value=data["description"], height=110)
+                auto_connect = st.checkbox(
+                    "Автоподключение при выборе проекта", value=data["auto_connect"])
+                keep_db_connection = st.checkbox(
+                    "Сохранять подключение к БД", value=data.get("keep_db_connection", False))
+                ssh_idle_timeout = st.number_input(
+                    "Таймаут бездействия SSH-канала, сек",
+                    min_value=60,
+                    max_value=86400,
+                    value=int(data.get("ssh_idle_timeout_seconds", 3600)),
+                )
 
             st.markdown("### Каталоги")
             col3, col4 = st.columns(2)
             with col3:
-                config_dir = st.text_input("Конфигурация", value=data["config_dir"])
-                externals_dir = st.text_input("Внешние файлы (EPF/ERF)", value=data["externals_dir"])
+                config_dir = st.text_input(
+                    "Конфигурация", value=data["config_dir"])
+                externals_dir = st.text_input(
+                    "Внешние файлы (EPF/ERF)", value=data["externals_dir"])
             with col4:
-                extensions_dir = st.text_input("Расширения", value=data["extensions_dir"])
-                externals_xml_dir = st.text_input("XML для внешних файлов", value=data["externals_xml_dir"])
+                extensions_dir = st.text_input(
+                    "Расширения", value=data["extensions_dir"])
+                externals_xml_dir = st.text_input(
+                    "XML для внешних файлов", value=data["externals_xml_dir"])
 
             st.markdown("### Опции выполнения")
             col5, col6, col7, col8 = st.columns(4)
@@ -186,12 +254,15 @@ class StreamlitApp:
                 use_server = st.checkbox("--server", value=data["use_server"])
                 update_flag = st.checkbox("--update", value=data["update"])
             with col6:
-                threads = st.number_input("--threads", min_value=0, max_value=32, value=int(data["threads"]))
+                threads = st.number_input(
+                    "--threads", min_value=0, max_value=32, value=int(data["threads"]))
                 force_flag = st.checkbox("--force", value=data["force"])
             with col7:
-                ignore_refs = st.checkbox("--ignore-unresolved-refs", value=data["ignore_unresolved_refs"])
+                ignore_refs = st.checkbox(
+                    "--ignore-unresolved-refs", value=data["ignore_unresolved_refs"])
                 no_check = st.checkbox("--no-check", value=data["no_check"])
-                update_dump_info = st.checkbox("--update-config-dump-info", value=data["update_config_dump_info"])
+                update_dump_info = st.checkbox(
+                    "--update-config-dump-info", value=data["update_config_dump_info"])
             with col8:
                 command_timeout = st.number_input(
                     "Таймаут команды (с)",
@@ -245,6 +316,8 @@ class StreamlitApp:
                     "command_timeout_seconds": int(command_timeout),
                 },
                 "auto_connect": auto_connect,
+                "keep_db_connection": keep_db_connection,
+                "ssh_idle_timeout_seconds": int(ssh_idle_timeout),
             }
             if data.get("uid"):
                 form_payload["uid"] = data["uid"]
@@ -257,7 +330,8 @@ class StreamlitApp:
             stored = self.storage.upsert(project, previous_uid=data.get("uid"))
             st.session_state.selected_project_uid = stored.uid
             st.session_state.project_form_data = self._project_to_form(stored)
-            st.session_state.project_flash = ("success", f"Проект '{stored.name}' сохранен.")
+            st.session_state.project_flash = (
+                "success", f"Проект '{stored.name}' сохранен.")
             st.rerun()
 
     # ------------------------------------------------------------ tabs: config
@@ -273,23 +347,19 @@ class StreamlitApp:
         col_dump, col_load = st.columns(2)
         with col_dump:
             if st.button("Выгрузить конфигурацию", disabled=self._is_operation_running()):
-                commands = build_dump_config_sequence(project)
-                self._queue_operation(
+                self._queue_api_operation(
                     project,
                     "Выгрузка конфигурации",
-                    commands,
+                    "/api/config/dump",
                     scope="configuration",
-                    command_timeout=project.options.command_timeout_seconds,
                 )
         with col_load:
             if st.button("Загрузить конфигурацию", disabled=self._is_operation_running()):
-                commands = build_load_config_sequence(project)
-                self._queue_operation(
+                self._queue_api_operation(
                     project,
                     "Загрузка конфигурации",
-                    commands,
+                    "/api/config/load",
                     scope="configuration",
-                    command_timeout=project.options.command_timeout_seconds,
                 )
 
         self._render_log_output()
@@ -303,28 +373,25 @@ class StreamlitApp:
 
         st.subheader(f"Расширения: {project.name}")
         st.write(f"Каталог расширений: `{project.extensions_dir}`")
-        st.write("Список: " + (", ".join(project.extensions) if project.extensions else "все расширения"))
+        st.write("Список: " + (", ".join(project.extensions)
+                 if project.extensions else "все расширения"))
 
         col_dump, col_load = st.columns(2)
         with col_dump:
             if st.button("Выгрузить расширения", disabled=self._is_operation_running()):
-                commands = build_dump_extensions_sequence(project)
-                self._queue_operation(
+                self._queue_api_operation(
                     project,
                     "Выгрузка расширений",
-                    commands,
+                    "/api/extensions/dump",
                     scope="extensions",
-                    command_timeout=project.options.command_timeout_seconds,
                 )
         with col_load:
             if st.button("Загрузить расширения", disabled=self._is_operation_running()):
-                commands = build_load_extensions_sequence(project)
-                self._queue_operation(
+                self._queue_api_operation(
                     project,
                     "Загрузка расширений",
-                    commands,
+                    "/api/extensions/load",
                     scope="extensions",
-                    command_timeout=project.options.command_timeout_seconds,
                 )
 
         self._render_log_output()
@@ -344,28 +411,26 @@ class StreamlitApp:
         with col_dump:
             if st.button("Выгрузить внешние файлы в XML", disabled=self._is_operation_running()):
                 if not project.external_objects:
-                    st.warning("Список внешних файлов пуст. Укажите имена файлов в проекте.")
+                    st.warning(
+                        "Список внешних файлов пуст. Укажите имена файлов в проекте.")
                 else:
-                    commands = build_dump_externals_sequence(project)
-                    self._queue_operation(
+                    self._queue_api_operation(
                         project,
                         "Выгрузка внешних файлов",
-                        commands,
+                        "/api/externals/export-xml",
                         scope="externals",
-                        command_timeout=project.options.command_timeout_seconds,
                     )
         with col_load:
             if st.button("Собрать EPF/ERF из XML", disabled=self._is_operation_running()):
                 if not project.external_objects:
-                    st.warning("Список внешних файлов пуст. Укажите имена файлов в проекте.")
+                    st.warning(
+                        "Список внешних файлов пуст. Укажите имена файлов в проекте.")
                 else:
-                    commands = build_load_externals_sequence(project)
-                    self._queue_operation(
+                    self._queue_api_operation(
                         project,
                         "Загрузка внешних файлов",
-                        commands,
+                        "/api/externals/build-from-xml",
                         scope="externals",
-                        command_timeout=project.options.command_timeout_seconds,
                     )
 
         self._render_log_output()
@@ -379,62 +444,45 @@ class StreamlitApp:
 
         st.subheader("Диагностика и инструменты")
         if st.button("Проверка подключения (help --version)", disabled=self._is_operation_running()):
-            commands = ["help --version"]
-            self._queue_operation(
+            self._queue_api_operation(
                 project,
                 "Проверка подключения",
-                commands,
-                connect_before=False,
+                "/api/tools/version",
                 scope="tools",
-                command_timeout=project.options.command_timeout_seconds,
             )
 
         st.markdown("---")
-        dump_path = st.text_input("Путь для dump-ib", value="../backups/dump.dt")
-        restore_path = st.text_input("Путь для restore-ib", value="../backups/dump.dt")
+        dump_path = st.text_input(
+            "Путь для dump-ib", value="../backups/dump.dt")
+        restore_path = st.text_input(
+            "Путь для restore-ib", value="../backups/dump.dt")
         col_dump, col_restore = st.columns(2)
         with col_dump:
             if st.button("dump-ib", disabled=self._is_operation_running()):
-                commands = [
-                    "common connect-ib",
-                    f'infobase-tools dump-ib --file="{dump_path}"',
-                    "common disconnect-ib",
-                ]
-                self._queue_operation(
+                self._queue_api_operation(
                     project,
                     "dump-ib",
-                    commands,
+                    "/api/infobase/dump",
+                    params={"file": dump_path},
                     scope="tools",
-                    command_timeout=project.options.command_timeout_seconds,
                 )
         with col_restore:
             if st.button("restore-ib", disabled=self._is_operation_running()):
-                commands = [
-                    "common connect-ib",
-                    f'infobase-tools restore-ib --file="{restore_path}"',
-                    "common disconnect-ib",
-                ]
-                self._queue_operation(
+                self._queue_api_operation(
                     project,
                     "restore-ib",
-                    commands,
+                    "/api/infobase/restore",
+                    params={"file": restore_path},
                     scope="tools",
-                    command_timeout=project.options.command_timeout_seconds,
                 )
 
         st.markdown("---")
         if st.button("Запустить update-db-cfg", disabled=self._is_operation_running()):
-            commands = [
-                "common connect-ib",
-                "config update-db-cfg",
-                "common disconnect-ib",
-            ]
-            self._queue_operation(
+            self._queue_api_operation(
                 project,
                 "update-db-cfg",
-                commands,
+                "/api/tools/update-db-cfg",
                 scope="tools",
-                command_timeout=project.options.command_timeout_seconds,
             )
 
         self._render_log_output()
@@ -463,29 +511,29 @@ class StreamlitApp:
 
         st.session_state.pending_operation = None
 
-        self._run_agent_operation(
-            project,
-            pending.get("title", "Операция"),
-            pending.get("commands", []),
-            pending.get("connect_before", True),
-            queued=True,
-            command_timeout=pending.get("timeout"),
-        )
+        api_path = pending.get("api_path")
+        if api_path:
+            self._run_api_operation(
+                project,
+                pending.get("title", "Операция"),
+                api_path,
+                pending.get("params", {}) or {},
+                queued=True,
+            )
+        else:
+            # Legacy no-op
+            self._set_operation_running(False)
 
-    def _run_agent_operation(
+    def _run_api_operation(
         self,
         project: ProjectModel,
         title: str,
-        commands: Iterable[str],
-        connect_before: bool = True,
+        api_path: str,
+        params: dict,
         queued: bool = False,
-        command_timeout: Optional[int] = None,
     ) -> None:
         if self._is_operation_running() and not queued:
             st.warning("Дождитесь завершения текущей операции.")
-            return
-
-        if connect_before and not commands:
             return
 
         self._set_operation_running(True)
@@ -493,34 +541,28 @@ class StreamlitApp:
         log_lines: List[str] = []
         started_at = time.time()
 
-        def progress(command: str, message: CommandMessage) -> None:
-            formatted = self._format_log_entry(command, message)
-            log_lines.append(formatted)
-            log_placeholder.code("\n".join(log_lines))
-
-        ordered = list(commands)
-        if connect_before and ordered and ordered[0] != "common connect-ib":
-            ordered.insert(0, "common connect-ib")
-            ordered.append("common disconnect-ib")
-
-        client = AgentClient(project)
         success = True
-        effective_timeout = command_timeout or project.options.command_timeout_seconds
         try:
-            results = client.execute_sequence(
-                ordered,
-                progress_cb=progress,
-                timeout_per_command=effective_timeout,
-            )
-            for result in results:
-                if not result.success:
-                    success = False
+            url = f"{self._api_base}{api_path}"
+            effective_params = dict(params or {})
+            effective_params["project_uid"] = project.uid
+            resp = requests.get(url, params=effective_params,
+                                timeout=project.options.command_timeout_seconds + 10)
+            try:
+                data = resp.json()
+            except Exception:
+                data = {"status": "error", "logs": [
+                    f"[error] HTTP {resp.status_code}"]}
+            logs = [str(x) for x in (data.get("logs") or [])]
+            log_lines.extend(logs)
+            success = (str(data.get("status")) == "success") and (
+                resp.status_code == 200)
+            log_placeholder.code("\n".join(log_lines))
         except Exception as exc:  # noqa: BLE001
             success = False
             log_lines.append(f"[error] {exc}")
             log_placeholder.code("\n".join(log_lines))
         finally:
-            client.disconnect()
             self._set_operation_running(False)
 
         log_placeholder.empty()
@@ -541,10 +583,17 @@ class StreamlitApp:
                 st.success(f"{title}: успешно")
             else:
                 st.error(f"{title}: ошибка, см. лог ниже")
+        # After any API operation, refresh DB session status from API
+        try:
+            self._refresh_db_status_from_api(project, force=True)
+        except Exception:
+            pass
 
     def _render_log_output(self, fallback_lines: Optional[List[str]] = None) -> None:
-        result: Optional[OperationResult] = st.session_state.get("last_operation_result")
-        log = fallback_lines or ([line for line in (result.messages if result else []) if line])
+        result: Optional[OperationResult] = st.session_state.get(
+            "last_operation_result")
+        log = fallback_lines or (
+            [line for line in (result.messages if result else []) if line])
 
         if result and result.title:
             message = f"{result.title}: {'успешно' if result.success else 'ошибка, см. лог ниже'}"
@@ -570,7 +619,8 @@ class StreamlitApp:
                 detail_parts.append(msg_text)
         if message.data:
             try:
-                detail_parts.append(json.dumps(message.data, ensure_ascii=False))
+                detail_parts.append(json.dumps(
+                    message.data, ensure_ascii=False))
             except TypeError:
                 detail_parts.append(str(message.data))
         detail = " | ".join(part for part in detail_parts if part)
@@ -591,17 +641,24 @@ class StreamlitApp:
         scope: str | None = None,
         command_timeout: Optional[int] = None,
     ) -> None:
-        command_list = list(commands)
-        if connect_before and not command_list:
-            return
+        # Legacy no-op to keep compatibility with old calls
+        self._set_operation_running(True)
+        st.rerun()
 
+    def _queue_api_operation(
+        self,
+        project: ProjectModel,
+        title: str,
+        api_path: str,
+        params: Optional[dict] = None,
+        scope: str | None = None,
+    ) -> None:
         st.session_state.pending_operation = {
             "project_uid": project.uid,
             "title": title,
-            "commands": command_list,
-            "connect_before": connect_before,
+            "api_path": api_path,
+            "params": params or {},
             "scope": scope,
-            "timeout": command_timeout,
         }
         self._set_operation_running(True)
         st.rerun()
@@ -637,7 +694,8 @@ class StreamlitApp:
             selected_uid = st.session_state.get("selected_project_uid")
             if selected_uid:
                 project = self.storage.get_project(selected_uid)
-                st.session_state.project_form_data = self._project_to_form(project)
+                st.session_state.project_form_data = self._project_to_form(
+                    project)
             else:
                 st.session_state.project_form_data = self._blank_form()
         if "operation_in_progress" not in st.session_state:
@@ -661,6 +719,8 @@ class StreamlitApp:
             "keepalive_interval": 30,
             "timeout": 30,
             "auto_connect": False,
+            "keep_db_connection": False,
+            "ssh_idle_timeout_seconds": 3600,
             "config_dir": "../Configuration",
             "extensions_dir": "../Extensions",
             "externals_dir": "../External",
@@ -693,6 +753,8 @@ class StreamlitApp:
             "keepalive_interval": project.credentials.keepalive_interval,
             "timeout": project.credentials.timeout,
             "auto_connect": project.auto_connect,
+            "keep_db_connection": getattr(project, "keep_db_connection", False),
+            "ssh_idle_timeout_seconds": getattr(project, "ssh_idle_timeout_seconds", 3600),
             "config_dir": project.config_dir,
             "extensions_dir": project.extensions_dir,
             "externals_dir": project.externals_dir,
@@ -715,16 +777,16 @@ class StreamlitApp:
         if not project:
             st.sidebar.error("Проект не найден.")
             return
-        
+
         # Создаём копию данных формы
         form_data = self._project_to_form(project)
-        
+
         # Обнуляем uid для создания нового проекта
         form_data["uid"] = None
-        
+
         # Добавляем суффикс " (копия)" к имени
         form_data["name"] = f"{project.name} (копия)"
-        
+
         # Переключаемся в режим создания нового проекта
         st.session_state.selected_project_uid = None
         st.session_state.project_form_data = form_data
@@ -735,6 +797,81 @@ class StreamlitApp:
         if not uid:
             return None
         return self.storage.get_project(uid)
+
+    # ------------------------------ DB session helpers (UI-scoped state)
+    def _db_state_keys(self, uid: str) -> tuple[str, str]:
+        return (f"db_connected__{uid}", f"db_connected_since__{uid}")
+
+    def _agent_state_key(self, uid: str) -> str:
+        return f"agent_connected__{uid}"
+
+    def _get_db_session_status(self, uid: str) -> tuple[bool, Optional[float]]:
+        key_conn, key_since = self._db_state_keys(uid)
+        return bool(st.session_state.get(key_conn)), st.session_state.get(key_since)
+
+    def _set_db_session_status(self, uid: str, connected: bool) -> None:
+        key_conn, key_since = self._db_state_keys(uid)
+        st.session_state[key_conn] = connected
+        st.session_state[key_since] = time.time() if connected else None
+
+    def _set_agent_status(self, uid: str, connected: bool) -> None:
+        st.session_state[self._agent_state_key(uid)] = connected
+
+    def _refresh_db_status_from_api(self, project: ProjectModel, force: bool = False) -> None:
+        if self._is_operation_running() and not force:
+            return
+        try:
+            url = f"{self._api_base}/api/common/status"
+            resp = requests.get(url, params={"project_uid": project.uid}, timeout=5)
+            data = resp.json() if resp.ok else {"agent_connected": None, "db_connected": None}
+            agent_connected = data.get("agent_connected")
+            db_connected = data.get("db_connected")
+            if isinstance(agent_connected, bool):
+                self._set_agent_status(project.uid, agent_connected)
+            if db_connected is True:
+                self._set_db_session_status(project.uid, True)
+            elif db_connected is False:
+                self._set_db_session_status(project.uid, False)
+            # if None (unknown) -> leave as-is
+        except Exception:
+            # Network or parse error: keep current UI value
+            pass
+
+    def _connect_db_now(self, project: ProjectModel) -> None:
+        self._set_operation_running(True)
+        try:
+            url = f"{self._api_base}/api/common/connect"
+            resp = requests.get(url, params={
+                                "project_uid": project.uid}, timeout=project.options.command_timeout_seconds + 10)
+            ok = resp.status_code == 200 and (
+                resp.json().get("status") == "success")
+            if ok:
+                self._set_db_session_status(project.uid, True)
+                st.sidebar.success("Подключение выполнено")
+            else:
+                st.sidebar.error("Не удалось подключиться")
+        except Exception as exc:  # noqa: BLE001
+            st.sidebar.error(f"Ошибка подключения: {exc}")
+        finally:
+            self._set_operation_running(False)
+
+    def _disconnect_db_now(self, project: ProjectModel) -> None:
+        self._set_operation_running(True)
+        try:
+            url = f"{self._api_base}/api/common/disconnect"
+            resp = requests.get(url, params={
+                                "project_uid": project.uid}, timeout=project.options.command_timeout_seconds + 10)
+            ok = resp.status_code == 200 and (
+                resp.json().get("status") == "success")
+            if ok:
+                self._set_db_session_status(project.uid, False)
+                st.sidebar.success("Отключено")
+            else:
+                st.sidebar.error("Не удалось отключиться")
+        except Exception as exc:  # noqa: BLE001
+            st.sidebar.error(f"Ошибка отключения: {exc}")
+        finally:
+            self._set_operation_running(False)
 
 
 def run_app() -> None:

@@ -85,7 +85,12 @@ class AgentClient:
 
     def __init__(self, project: ProjectModel) -> None:
         self.project = project
-        self._ssh = SSHConnectionManager(project.credentials)
+        # Reuse SSH channel with optional idle timeout from project settings
+        self._ssh = SSHConnectionManager(
+            project.credentials,
+            idle_timeout_seconds=getattr(
+                project, "ssh_idle_timeout_seconds", None),
+        )
         self._session = AgentSessionInfo()
         self._parser = _JsonArrayParser()
 
@@ -98,9 +103,12 @@ class AgentClient:
         elapsed_ms = int((t1 - t0) * 1000)
         # Only trace when channel was created/refreshed or took noticeable time
         if prev is None or getattr(prev, "closed", True) or (prev is not channel) or elapsed_ms > 5:
-            self._trace(progress_cb, "SSH channel ready", {
-                "elapsed_ms": elapsed_ms,
-            })
+            self._trace(progress_cb, "SSH channel ready",
+                        {"elapsed_ms": elapsed_ms, "ssh": self._ssh.debug_info()})
+        # If channel was recreated, reset session flags so that we reinitialize
+        if prev is not channel:
+            self._session.banner = ""
+            self._session.initialized = False
 
         if not self._session.banner:
             t2 = time.perf_counter()
@@ -114,20 +122,68 @@ class AgentClient:
             t4 = time.perf_counter()
             self._initialize_session(channel, progress_cb)
             t5 = time.perf_counter()
-            self._trace(progress_cb, "Initialized agent session", {
-                "elapsed_ms": int((t5 - t4) * 1000),
-            })
+            self._trace(progress_cb, "Initialized agent session",
+                        {"elapsed_ms": int((t5 - t4) * 1000), "ssh": self._ssh.debug_info()})
 
     def disconnect(self) -> None:
         self._ssh.close()
         self._session = AgentSessionInfo()
         self._parser.reset()
 
+    def is_usable(self) -> bool:
+        try:
+            client = self._ssh.client
+            if not client:
+                return False
+            transport = client.get_transport()
+            return bool(transport and transport.is_active())
+        except Exception:
+            return False
+
     def connect_ib(self, progress_cb: Optional[ProgressCallback] = None) -> CommandResult:
+        self._trace(progress_cb, "Connect IB requested", {"ssh": self._ssh.debug_info()})
         return self.execute("common connect-ib", timeout=60.0, progress_cb=progress_cb)
 
     def disconnect_ib(self, progress_cb: Optional[ProgressCallback] = None) -> CommandResult:
+        self._trace(progress_cb, "Disconnect IB requested", {"ssh": self._ssh.debug_info()})
         return self.execute("common disconnect-ib", timeout=30.0, progress_cb=progress_cb)
+
+    def check_agent_connected(self) -> Optional[bool]:
+        """
+        Check if the SSH channel + agent session is responsive.
+        Does NOT reflect DB (infobase) connectivity.
+        """
+        try:
+            # Ensure channel + JSON session; then a light command
+            self.ensure_connected(None)
+            result = self.execute("help --version", timeout=10.0, progress_cb=None)
+            return any(msg.type == "success" for msg in result.messages)
+        except Exception:
+            return False
+
+    def ensure_db_connected(
+        self,
+        progress_cb: Optional[ProgressCallback] = None,
+        assume_disconnected: bool = False,
+    ) -> None:
+        """
+        Ensure there is an active infobase connection.
+
+        We cannot reliably probe DB connectivity (help --version is agent-only),
+        so the most robust approach is to always attempt a silent connect and
+        tolerate the "already connected" condition. This makes persistent flows
+        resilient without spamming UI logs.
+        """
+        result = self.connect_ib(progress_cb=None)
+        if not result.success:
+            tolerated = False
+            for msg in result.messages:
+                data = msg.data or {}
+                if isinstance(data, dict) and data.get("error-type") == "DesignerAlreadyConnectedToInfoBase":
+                    tolerated = True
+                    break
+            if not tolerated:
+                raise RuntimeError("ensure_db_connected: failed to connect to infobase")
 
     # Execution ------------------------------------------------------------------
     def execute(self, command: str, timeout: float = 120.0, progress_cb: Optional[ProgressCallback] = None) -> CommandResult:
@@ -139,9 +195,10 @@ class AgentClient:
 
         result = CommandResult(command=command, success=False)
         if progress_cb is None:
-            progress_cb = lambda cmd, msg: None  # noqa: E731
+            def progress_cb(cmd, msg): return None  # noqa: E731
 
         self._parser.reset()
+        self._trace(progress_cb, "Sending command", {"command": command, "timeout": timeout, "ssh": self._ssh.debug_info()})
         channel.send(command + "\n")
         deadline = time.time() + timeout
         messages: List[CommandMessage] = []
@@ -161,7 +218,8 @@ class AgentClient:
                             type=entry.get("type", "log"),
                             message=entry.get("message"),
                             title=entry.get("title"),
-                            data={k: v for k, v in entry.items() if k not in {"type", "message", "title"}},
+                            data={k: v for k, v in entry.items() if k not in {
+                                "type", "message", "title"}},
                         )
                         messages.append(message)
                         progress_cb(command, message)
@@ -174,9 +232,11 @@ class AgentClient:
                 if finished:
                     break
             elif channel.recv_stderr_ready():
-                chunk = channel.recv_stderr(4096).decode("utf-8", errors="ignore")
+                chunk = channel.recv_stderr(4096).decode(
+                    "utf-8", errors="ignore")
                 if chunk:
-                    message = CommandMessage(type="error", message=chunk.strip())
+                    message = CommandMessage(
+                        type="error", message=chunk.strip())
                     messages.append(message)
                     progress_cb(command, message)
                     finished = True
@@ -188,8 +248,20 @@ class AgentClient:
         result.messages = messages
         result.mark_finished()
         if not finished:
-            raise TimeoutError(f"Timeout while waiting for result of '{command}'.")
+            raise TimeoutError(
+                f"Timeout while waiting for result of '{command}'.")
         self._drain_channel(channel)
+        # Update last-used mark for idle timeout handling
+        try:
+            self._ssh.mark_used()
+        except Exception:
+            pass
+        self._trace(progress_cb, "Command finished", {
+            "command": command,
+            "success": result.success,
+            "messages": len(messages),
+            "ssh": self._ssh.debug_info(),
+        })
         return result
 
     def execute_sequence(
@@ -205,7 +277,8 @@ class AgentClient:
         results = []
         try:
             for command in commands:
-                result = self.execute(command, timeout_per_command, progress_cb)
+                result = self.execute(
+                    command, timeout_per_command, progress_cb)
                 results.append(result)
                 if stop_on_error and not result.success:
                     break
@@ -224,7 +297,8 @@ class AgentClient:
         t0 = time.perf_counter()
         channel.send(command + "\n")
         # Drain output until the channel becomes quiet to avoid fixed sleeps
-        drained = self._drain_until_quiet(channel, quiet_time=0.1, max_time=0.8)
+        drained = self._drain_until_quiet(
+            channel, quiet_time=0.1, max_time=0.8)
         t1 = time.perf_counter()
         self._trace(progress_cb, "Init step", {
             "command": command,
@@ -252,6 +326,7 @@ class AgentClient:
         return "".join(banner)
 
     def _drain_channel(self, channel: paramiko.Channel) -> None:
+        # Drain any trailing noise to keep the stream parser clean for next command
         start = time.time()
         while time.time() - start < 0.5:
             if channel.recv_ready():
@@ -265,9 +340,8 @@ class AgentClient:
             raise SSHConnectionError("SSH channel is not available.")
         return channel
 
-    # ----------------------------------------------------------------------------
     def _drain_until_quiet(self, channel: paramiko.Channel, *, quiet_time: float = 0.1, max_time: float = 0.6) -> str:
-        """Read from channel until no data arrives for quiet_time or max_time passes."""
+        # Read from channel until no data for quiet_time or max_time passes
         start = time.perf_counter()
         last_data = start
         chunks: list[str] = []
@@ -291,8 +365,34 @@ class AgentClient:
         if os.getenv("ONEC_AGENT_UI_DEBUG_TRACE", "").lower() not in {"1", "true", "yes"}:
             return
         try:
-            message = CommandMessage(type="log", title=f"[client] {title}", data=data)
+            message = CommandMessage(
+                type="log", title=f"[client] {title}", data=data)
             progress_cb("[client]", message)
         except Exception:
             # Do not let tracing affect execution
+            pass
+
+
+# ----------------------------------------------------------------------------
+# Shared AgentClient pool for persistent sessions per project
+_CLIENT_POOL: dict[str, AgentClient] = {}
+
+
+def get_agent_client(project: ProjectModel, persistent: bool = False) -> AgentClient:
+    if not persistent:
+        return AgentClient(project)
+    existing = _CLIENT_POOL.get(project.uid)
+    if existing and existing.is_usable():
+        return existing
+    client = AgentClient(project)
+    _CLIENT_POOL[project.uid] = client
+    return client
+
+
+def release_agent_client(project_uid: str) -> None:
+    client = _CLIENT_POOL.pop(project_uid, None)
+    if client:
+        try:
+            client.disconnect()
+        except Exception:
             pass
