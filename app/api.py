@@ -7,6 +7,8 @@ from __future__ import annotations
 import time
 import json
 from dataclasses import dataclass
+import os
+import logging
 from threading import Lock
 from typing import Callable, Iterable, List
 from uuid import UUID
@@ -14,7 +16,8 @@ from uuid import UUID
 from fastapi import FastAPI, Query
 from fastapi.responses import JSONResponse
 
-from .agent_client import FINAL_MESSAGE_TYPES, AgentClient
+from .agent_client import FINAL_MESSAGE_TYPES, AgentClient, get_agent_client, release_agent_client
+from .session import get_owner as get_session_owner, acquire_owner as acquire_session_owner, release_owner as release_session_owner
 from .models import CommandMessage, CommandResult, ProjectModel
 from .operations import (
     build_dump_config_sequence,
@@ -40,6 +43,33 @@ class OperationSpec:
 app = FastAPI(title=APP_TITLE)
 _storage = ProjectStorage()
 _global_lock = Lock()
+_API_DEBUG = os.getenv("ONEC_AGENT_API_DEBUG_TRACE", "").lower() in {"1", "true", "yes"}
+_logger = logging.getLogger("uvicorn.error")
+
+
+def _trace_api(event: str, payload: dict | None = None) -> None:
+    if not _API_DEBUG:
+        return
+    try:
+        _logger.info("[api] %s | %s", event, payload or {})
+    except Exception:
+        pass
+
+
+@app.middleware("http")
+async def _log_requests(request, call_next):
+    if _API_DEBUG:
+        try:
+            _logger.info("[api] -> %s %s", request.method, str(request.url))
+        except Exception:
+            pass
+    response = await call_next(request)
+    if _API_DEBUG:
+        try:
+            _logger.info("[api] <- %s %s %s", request.method, str(request.url), response.status_code)
+        except Exception:
+            pass
+    return response
 
 _OPERATIONS = {
     "config_dump": OperationSpec(build_dump_config_sequence, "Выгрузка конфигурации"),
@@ -116,7 +146,21 @@ def _load_project(project_uid: str) -> ProjectModel | None:
 
 def _execute_operation(spec: OperationSpec, project: ProjectModel) -> JSONResponse:
     with _global_lock:
-        client = AgentClient(project)
+        persistent = bool(getattr(project, "keep_db_connection", False))
+        if persistent:
+            owner = get_session_owner(project.uid)
+            # Allow persistent mode only if no owner or API already owns it
+            if owner and owner.owner_id != "api":
+                persistent = False
+        # If another process owns the persistent session, block IB-required operations
+        owner = get_session_owner(project.uid)
+        if owner and owner.owner_id != "api":
+            return _error_response(
+                423,
+                "[error] Сессия БД занята другим процессом (UI). Выполните операцию из UI или отключите сессию.",
+            )
+        _trace_api("begin", {"op": spec.title, "persistent": persistent, "project": project.uid})
+        client = get_agent_client(project, persistent=persistent)
         logs: List[str] = []
         final_status: str | None = None
         http_status = 200
@@ -129,8 +173,28 @@ def _execute_operation(spec: OperationSpec, project: ProjectModel) -> JSONRespon
                 final_status = message.type
 
         try:
+            commands = list(spec.builder(project))
+            _trace_api("built_commands", {"count": len(commands)})
+            if persistent:
+                # Strip explicit connect/disconnect; ensure connection explicitly
+                if commands and commands[0] == "common connect-ib":
+                    commands = commands[1:]
+                if commands and commands[-1] == "common disconnect-ib":
+                    commands = commands[:-1]
+                try:
+                    _trace_api("ensure_connect", None)
+                    # Acquire ownership for API to avoid cross-process contention
+                    acquired = acquire_session_owner(project.uid, "api", force=False)
+                    if not acquired:
+                        persistent = False
+                    else:
+                        client.ensure_db_connected(progress, assume_disconnected=False)
+                except Exception as exc:  # noqa: BLE001
+                    logs.append(f"[error] ensure-connect failed: {exc}")
+                    final_status = "error"
+            _trace_api("exec_sequence_start", {"count": len(commands)})
             results = client.execute_sequence(
-                spec.builder(project),
+                commands,
                 timeout_per_command=project.options.command_timeout_seconds,
                 progress_cb=progress,
             )
@@ -141,11 +205,13 @@ def _execute_operation(spec: OperationSpec, project: ProjectModel) -> JSONRespon
             http_status = 500
             logs.append(f"[error] {exc}")
         finally:
-            try:
-                client.disconnect()
-            except Exception:  # noqa: BLE001
-                pass
+            if not persistent:
+                try:
+                    client.disconnect()
+                except Exception:  # noqa: BLE001
+                    pass
             elapsed = time.perf_counter() - started
+            _trace_api("end", {"status": final_status, "elapsed": elapsed})
             logs.append(f"[info] {spec.title} завершена за {elapsed:.1f} сек.")
 
         limited = _limit_logs(logs)
@@ -200,3 +266,160 @@ def export_externals(project_uid: str | None = Query(default=None)) -> JSONRespo
 @app.get("/api/externals/build-from-xml")
 def build_externals(project_uid: str | None = Query(default=None)) -> JSONResponse:
     return _handle_request("externals_build", project_uid)
+
+
+@app.get("/health")
+def health() -> JSONResponse:
+    return JSONResponse(status_code=200, content={"status": "ok"})
+
+
+# ----------------------------- direct endpoints for UI integrations
+
+def _json_logs_response(title: str, logs: List[str], status: str, http_status: int = 200) -> JSONResponse:
+    limited = _limit_logs(logs)
+    return JSONResponse(status_code=http_status, content={"status": status, "logs": limited, "title": title})
+
+
+def _client_progress_logger(logs: List[str]):
+    def _progress(command: str, message: CommandMessage) -> None:
+        logs.append(_format_log_entry(command, message))
+    return _progress
+
+
+def _get_project_or_error(project_uid: str | None) -> ProjectModel | JSONResponse:
+    if not project_uid:
+        return _error_response(400, "[error] Обязательный параметр 'project_uid' не указан.")
+    try:
+        _storage.reload()
+        project = _load_project(project_uid)
+    except ValueError:
+        return _error_response(400, "[error] Значение 'project_uid' должно быть валидным UUID.")
+    if not project:
+        return _error_response(404, f"[error] Проект '{project_uid}' не найден.")
+    return project
+
+
+@app.get("/api/common/connect")
+def api_connect(project_uid: str | None = Query(default=None)) -> JSONResponse:
+    project = _get_project_or_error(project_uid)
+    if isinstance(project, JSONResponse):
+        return project
+    logs: List[str] = []
+    client = get_agent_client(project, persistent=True)
+    try:
+        progress = _client_progress_logger(logs)
+        # ensure SSH + JSON session initialized
+        client.ensure_connected(progress)
+        # ensure DB connected
+        client.ensure_db_connected(progress, assume_disconnected=False)
+        logs.append("[info] Подключение выполнено")
+        return _json_logs_response("connect-ib", logs, "success")
+    except Exception as exc:  # noqa: BLE001
+        logs.append(f"[error] {exc}")
+        return _json_logs_response("connect-ib", logs, "error", 500)
+
+
+@app.get("/api/common/disconnect")
+def api_disconnect(project_uid: str | None = Query(default=None)) -> JSONResponse:
+    project = _get_project_or_error(project_uid)
+    if isinstance(project, JSONResponse):
+        return project
+    logs: List[str] = []
+    client = get_agent_client(project, persistent=True)
+    try:
+        progress = _client_progress_logger(logs)
+        client.disconnect_ib(progress)
+        release_agent_client(project.uid)
+        logs.append("[info] Отключение выполнено")
+        return _json_logs_response("disconnect-ib", logs, "success")
+    except Exception as exc:  # noqa: BLE001
+        logs.append(f"[error] {exc}")
+        return _json_logs_response("disconnect-ib", logs, "error", 500)
+
+
+@app.get("/api/tools/version")
+def api_version(project_uid: str | None = Query(default=None)) -> JSONResponse:
+    project = _get_project_or_error(project_uid)
+    if isinstance(project, JSONResponse):
+        return project
+    logs: List[str] = []
+    client = get_agent_client(project, persistent=True)
+    try:
+        progress = _client_progress_logger(logs)
+        client.ensure_connected(progress)
+        results = client.execute_sequence(["help --version"], timeout_per_command=project.options.command_timeout_seconds, progress_cb=progress)
+        status = _infer_status_from_results(results)
+        return _json_logs_response("help --version", logs, status)
+    except Exception as exc:  # noqa: BLE001
+        logs.append(f"[error] {exc}")
+        return _json_logs_response("help --version", logs, "error", 500)
+
+
+@app.get("/api/infobase/dump")
+def api_dump_ib(project_uid: str | None = Query(default=None), file: str | None = Query(default=None)) -> JSONResponse:
+    project = _get_project_or_error(project_uid)
+    if isinstance(project, JSONResponse):
+        return project
+    if not file:
+        return _error_response(400, "[error] Обязательный параметр 'file' не указан.")
+    logs: List[str] = []
+    client = get_agent_client(project, persistent=True)
+    try:
+        progress = _client_progress_logger(logs)
+        commands = [
+            "common connect-ib",
+            f'infobase-tools dump-ib --file="{file}"',
+            "common disconnect-ib",
+        ]
+        results = client.execute_sequence(commands, timeout_per_command=project.options.command_timeout_seconds, progress_cb=progress)
+        status = _infer_status_from_results(results)
+        return _json_logs_response("dump-ib", logs, status)
+    except Exception as exc:  # noqa: BLE001
+        logs.append(f"[error] {exc}")
+        return _json_logs_response("dump-ib", logs, "error", 500)
+
+
+@app.get("/api/infobase/restore")
+def api_restore_ib(project_uid: str | None = Query(default=None), file: str | None = Query(default=None)) -> JSONResponse:
+    project = _get_project_or_error(project_uid)
+    if isinstance(project, JSONResponse):
+        return project
+    if not file:
+        return _error_response(400, "[error] Обязательный параметр 'file' не указан.")
+    logs: List[str] = []
+    client = get_agent_client(project, persistent=True)
+    try:
+        progress = _client_progress_logger(logs)
+        commands = [
+            "common connect-ib",
+            f'infobase-tools restore-ib --file="{file}"',
+            "common disconnect-ib",
+        ]
+        results = client.execute_sequence(commands, timeout_per_command=project.options.command_timeout_seconds, progress_cb=progress)
+        status = _infer_status_from_results(results)
+        return _json_logs_response("restore-ib", logs, status)
+    except Exception as exc:  # noqa: BLE001
+        logs.append(f"[error] {exc}")
+        return _json_logs_response("restore-ib", logs, "error", 500)
+
+
+@app.get("/api/tools/update-db-cfg")
+def api_update_db_cfg(project_uid: str | None = Query(default=None)) -> JSONResponse:
+    project = _get_project_or_error(project_uid)
+    if isinstance(project, JSONResponse):
+        return project
+    logs: List[str] = []
+    client = get_agent_client(project, persistent=True)
+    try:
+        progress = _client_progress_logger(logs)
+        commands = [
+            "common connect-ib",
+            "config update-db-cfg",
+            "common disconnect-ib",
+        ]
+        results = client.execute_sequence(commands, timeout_per_command=project.options.command_timeout_seconds, progress_cb=progress)
+        status = _infer_status_from_results(results)
+        return _json_logs_response("update-db-cfg", logs, status)
+    except Exception as exc:  # noqa: BLE001
+        logs.append(f"[error] {exc}")
+        return _json_logs_response("update-db-cfg", logs, "error", 500)

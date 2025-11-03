@@ -65,6 +65,16 @@ class ProjectModel(BaseModel):
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     updated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     auto_connect: bool = Field(False, description="Automatically connect on project selection.")
+    keep_db_connection: bool = Field(
+        False,
+        description="Keep database connection active between operations.",
+    )
+    ssh_idle_timeout_seconds: int = Field(
+        3600,
+        ge=60,
+        le=86400,
+        description="Auto-close SSH channel after inactivity (seconds).",
+    )
 
     @validator(
         "config_dir",
