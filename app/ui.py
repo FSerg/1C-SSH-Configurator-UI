@@ -111,6 +111,16 @@ class StreamlitApp:
                 st.session_state.selected_project_uid = choice.uid
                 st.session_state.project_form_data = self._project_to_form(
                     choice)
+                # Reset last operation summary and clear cached status markers
+                st.session_state.last_operation_result = None
+                try:
+                    # Clear per-project status to force fresh fetch on rerun
+                    st.session_state.pop(self._agent_state_key(choice.uid), None)
+                    key_conn, key_since = self._db_state_keys(choice.uid)
+                    st.session_state.pop(key_conn, None)
+                    st.session_state.pop(key_since, None)
+                except Exception:
+                    pass
                 st.rerun()
         else:
             st.sidebar.info("Проекты не созданы.")
@@ -150,13 +160,20 @@ class StreamlitApp:
                 st.sidebar.subheader("Сессия БД")
                 # Pull fresh status from API and update local cache
                 self._refresh_db_status_from_api(project)
+                agent_connected = bool(st.session_state.get(self._agent_state_key(project.uid)))
                 connected, since = self._get_db_session_status(project.uid)
+                # Agent line
+                if agent_connected:
+                    st.sidebar.success("Агент: онлайн")
+                else:
+                    st.sidebar.error("Агент: оффлайн")
+                # DB line
                 if connected:
                     ts = time.strftime('%Y-%m-%d %H:%M:%S',
                                        time.localtime(since or time.time()))
-                    st.sidebar.success(f"Подключено с {ts}")
+                    st.sidebar.success(f"База: подключено с {ts}")
                 else:
-                    st.sidebar.info("Не подключено")
+                    st.sidebar.info("База: не подключено")
 
                 if st.sidebar.button("Подключиться к БД", disabled=self._is_operation_running()):
                     self._connect_db_now(project)
@@ -566,6 +583,11 @@ class StreamlitApp:
                 st.success(f"{title}: успешно")
             else:
                 st.error(f"{title}: ошибка, см. лог ниже")
+        # After any API operation, refresh DB session status from API
+        try:
+            self._refresh_db_status_from_api(project, force=True)
+        except Exception:
+            pass
 
     def _render_log_output(self, fallback_lines: Optional[List[str]] = None) -> None:
         result: Optional[OperationResult] = st.session_state.get(
@@ -780,6 +802,9 @@ class StreamlitApp:
     def _db_state_keys(self, uid: str) -> tuple[str, str]:
         return (f"db_connected__{uid}", f"db_connected_since__{uid}")
 
+    def _agent_state_key(self, uid: str) -> str:
+        return f"agent_connected__{uid}"
+
     def _get_db_session_status(self, uid: str) -> tuple[bool, Optional[float]]:
         key_conn, key_since = self._db_state_keys(uid)
         return bool(st.session_state.get(key_conn)), st.session_state.get(key_since)
@@ -789,17 +814,23 @@ class StreamlitApp:
         st.session_state[key_conn] = connected
         st.session_state[key_since] = time.time() if connected else None
 
+    def _set_agent_status(self, uid: str, connected: bool) -> None:
+        st.session_state[self._agent_state_key(uid)] = connected
+
     def _refresh_db_status_from_api(self, project: ProjectModel, force: bool = False) -> None:
         if self._is_operation_running() and not force:
             return
         try:
             url = f"{self._api_base}/api/common/status"
             resp = requests.get(url, params={"project_uid": project.uid}, timeout=5)
-            data = resp.json() if resp.ok else {"connected": None}
-            connected = data.get("connected")
-            if connected is True:
+            data = resp.json() if resp.ok else {"agent_connected": None, "db_connected": None}
+            agent_connected = data.get("agent_connected")
+            db_connected = data.get("db_connected")
+            if isinstance(agent_connected, bool):
+                self._set_agent_status(project.uid, agent_connected)
+            if db_connected is True:
                 self._set_db_session_status(project.uid, True)
-            elif connected is False:
+            elif db_connected is False:
                 self._set_db_session_status(project.uid, False)
             # if None (unknown) -> leave as-is
         except Exception:

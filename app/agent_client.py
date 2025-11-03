@@ -148,24 +148,18 @@ class AgentClient:
         self._trace(progress_cb, "Disconnect IB requested", {"ssh": self._ssh.debug_info()})
         return self.execute("common disconnect-ib", timeout=30.0, progress_cb=progress_cb)
 
-    def check_db_connected(self) -> Optional[bool]:
+    def check_agent_connected(self) -> Optional[bool]:
         """
-        Attempt to infer whether the agent is connected to an infobase.
-        Returns True/False when determinable, or None if unknown.
+        Check if the SSH channel + agent session is responsive.
+        Does NOT reflect DB (infobase) connectivity.
         """
         try:
-            result = self.execute(
-                "help --version", timeout=10.0, progress_cb=None)
+            # Ensure channel + JSON session; then a light command
+            self.ensure_connected(None)
+            result = self.execute("help --version", timeout=10.0, progress_cb=None)
+            return any(msg.type == "success" for msg in result.messages)
         except Exception:
-            return None
-        # Heuristic: look for structured data fields commonly reported by agents
-        for message in reversed(result.messages):
-            data = message.data or {}
-            # Known conventions: {"infobase_connected": true|false}
-            for key in ("infobase_connected", "db_connected", "connected"):
-                if key in data and isinstance(data[key], bool):
-                    return bool(data[key])
-        return None
+            return False
 
     def ensure_db_connected(
         self,
@@ -173,27 +167,23 @@ class AgentClient:
         assume_disconnected: bool = False,
     ) -> None:
         """
-        Ensure there is an active infobase connection. If status cannot be
-        determined, avoid redundant connect to prevent spurious errors.
+        Ensure there is an active infobase connection.
+
+        We cannot reliably probe DB connectivity (help --version is agent-only),
+        so the most robust approach is to always attempt a silent connect and
+        tolerate the "already connected" condition. This makes persistent flows
+        resilient without spamming UI logs.
         """
-        status = None
-        try:
-            status = self.check_db_connected()
-        except Exception:
-            status = None
-        # Connect when disconnected, or when status is unknown (silent ensure).
-        if status is False or (status is None or assume_disconnected):
-            # Silent ensure-connect to avoid noisy logs; tolerate already-connected.
-            result = self.connect_ib(progress_cb=None)
-            if not result.success:
-                tolerated = False
-                for msg in result.messages:
-                    data = msg.data or {}
-                    if isinstance(data, dict) and data.get("error-type") == "DesignerAlreadyConnectedToInfoBase":
-                        tolerated = True
-                        break
-                if not tolerated:
-                    raise RuntimeError("ensure_db_connected: failed to connect to infobase")
+        result = self.connect_ib(progress_cb=None)
+        if not result.success:
+            tolerated = False
+            for msg in result.messages:
+                data = msg.data or {}
+                if isinstance(data, dict) and data.get("error-type") == "DesignerAlreadyConnectedToInfoBase":
+                    tolerated = True
+                    break
+            if not tolerated:
+                raise RuntimeError("ensure_db_connected: failed to connect to infobase")
 
     # Execution ------------------------------------------------------------------
     def execute(self, command: str, timeout: float = 120.0, progress_cb: Optional[ProgressCallback] = None) -> CommandResult:

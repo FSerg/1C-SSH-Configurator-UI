@@ -10,7 +10,7 @@ from dataclasses import dataclass
 import os
 import logging
 from threading import Lock
-from typing import Callable, Iterable, List
+from typing import Callable, Iterable, List, Dict
 from uuid import UUID
 
 from fastapi import FastAPI, Query
@@ -45,6 +45,7 @@ _storage = ProjectStorage()
 _global_lock = Lock()
 _API_DEBUG = os.getenv("ONEC_AGENT_API_DEBUG_TRACE", "").lower() in {"1", "true", "yes"}
 _logger = logging.getLogger("uvicorn.error")
+_CONNECTION_STATE: Dict[str, bool] = {}
 
 
 def _trace_api(event: str, payload: dict | None = None) -> None:
@@ -189,6 +190,7 @@ def _execute_operation(spec: OperationSpec, project: ProjectModel) -> JSONRespon
                         persistent = False
                     else:
                         client.ensure_db_connected(progress, assume_disconnected=False)
+                        _CONNECTION_STATE[project.uid] = True
                 except Exception as exc:  # noqa: BLE001
                     logs.append(f"[error] ensure-connect failed: {exc}")
                     final_status = "error"
@@ -200,6 +202,9 @@ def _execute_operation(spec: OperationSpec, project: ProjectModel) -> JSONRespon
             )
             if final_status is None:
                 final_status = _infer_status_from_results(results)
+            # If we kept the connection open (persistent), consider DB connected
+            if persistent and final_status == "success":
+                _CONNECTION_STATE[project.uid] = True
         except Exception as exc:  # noqa: BLE001
             final_status = "error"
             http_status = 500
@@ -312,6 +317,7 @@ def api_connect(project_uid: str | None = Query(default=None)) -> JSONResponse:
         client.ensure_connected(progress)
         # ensure DB connected
         client.ensure_db_connected(progress, assume_disconnected=False)
+        _CONNECTION_STATE[project.uid] = True
         logs.append("[info] Подключение выполнено")
         return _json_logs_response("connect-ib", logs, "success")
     except Exception as exc:  # noqa: BLE001
@@ -330,6 +336,7 @@ def api_disconnect(project_uid: str | None = Query(default=None)) -> JSONRespons
         progress = _client_progress_logger(logs)
         client.disconnect_ib(progress)
         release_agent_client(project.uid)
+        _CONNECTION_STATE[project.uid] = False
         logs.append("[info] Отключение выполнено")
         return _json_logs_response("disconnect-ib", logs, "success")
     except Exception as exc:  # noqa: BLE001
@@ -362,17 +369,19 @@ def api_status(project_uid: str | None = Query(default=None)) -> JSONResponse:
         return project
     client = get_agent_client(project, persistent=True)
     try:
-        # Make sure channel/session exists but do not connect IB implicitly
-        client.ensure_connected(None)
-        connected = client.check_db_connected()
+        # Agent connectivity probe only; DB from cached state
+        agent_ok = client.check_agent_connected()
+        from_state = _CONNECTION_STATE.get(project.uid)
         return JSONResponse(status_code=200, content={
             "status": "success",
-            "connected": connected,
+            "agent_connected": bool(agent_ok),
+            "db_connected": from_state if isinstance(from_state, bool) else None,
         })
     except Exception as exc:  # noqa: BLE001
         return JSONResponse(status_code=200, content={
             "status": "error",
-            "connected": None,
+            "agent_connected": False,
+            "db_connected": _CONNECTION_STATE.get(project.uid) if isinstance(_CONNECTION_STATE.get(project.uid), bool) else None,
             "error": str(exc),
         })
 
