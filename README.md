@@ -1,3 +1,5 @@
+- [Обновление 1.02](docs/release-1.02.md)
+- [Обновление 1.01](https://github.com/FSerg/1C-SSH-Configurator-UI/releases/tag/v1.01)
 
 # 1C Agent UI (Streamlit)
 
