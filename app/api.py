@@ -355,6 +355,28 @@ def api_version(project_uid: str | None = Query(default=None)) -> JSONResponse:
         return _json_logs_response("help --version", logs, "error", 500)
 
 
+@app.get("/api/common/status")
+def api_status(project_uid: str | None = Query(default=None)) -> JSONResponse:
+    project = _get_project_or_error(project_uid)
+    if isinstance(project, JSONResponse):
+        return project
+    client = get_agent_client(project, persistent=True)
+    try:
+        # Make sure channel/session exists but do not connect IB implicitly
+        client.ensure_connected(None)
+        connected = client.check_db_connected()
+        return JSONResponse(status_code=200, content={
+            "status": "success",
+            "connected": connected,
+        })
+    except Exception as exc:  # noqa: BLE001
+        return JSONResponse(status_code=200, content={
+            "status": "error",
+            "connected": None,
+            "error": str(exc),
+        })
+
+
 @app.get("/api/infobase/dump")
 def api_dump_ib(project_uid: str | None = Query(default=None), file: str | None = Query(default=None)) -> JSONResponse:
     project = _get_project_or_error(project_uid)

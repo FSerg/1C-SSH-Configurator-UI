@@ -148,6 +148,8 @@ class StreamlitApp:
             if project and getattr(project, "keep_db_connection", False):
                 st.sidebar.markdown("---")
                 st.sidebar.subheader("Сессия БД")
+                # Pull fresh status from API and update local cache
+                self._refresh_db_status_from_api(project)
                 connected, since = self._get_db_session_status(project.uid)
                 if connected:
                     ts = time.strftime('%Y-%m-%d %H:%M:%S',
@@ -160,6 +162,8 @@ class StreamlitApp:
                     self._connect_db_now(project)
                 if st.sidebar.button("Отключиться от БД", disabled=self._is_operation_running()):
                     self._disconnect_db_now(project)
+                if st.sidebar.button("Обновить статус", disabled=self._is_operation_running()):
+                    self._refresh_db_status_from_api(project, force=True)
 
     # --------------------------------------------------------------- tabs: CRUD
     def _render_project_tab(self, projects: List[ProjectModel]) -> None:
@@ -784,6 +788,23 @@ class StreamlitApp:
         key_conn, key_since = self._db_state_keys(uid)
         st.session_state[key_conn] = connected
         st.session_state[key_since] = time.time() if connected else None
+
+    def _refresh_db_status_from_api(self, project: ProjectModel, force: bool = False) -> None:
+        if self._is_operation_running() and not force:
+            return
+        try:
+            url = f"{self._api_base}/api/common/status"
+            resp = requests.get(url, params={"project_uid": project.uid}, timeout=5)
+            data = resp.json() if resp.ok else {"connected": None}
+            connected = data.get("connected")
+            if connected is True:
+                self._set_db_session_status(project.uid, True)
+            elif connected is False:
+                self._set_db_session_status(project.uid, False)
+            # if None (unknown) -> leave as-is
+        except Exception:
+            # Network or parse error: keep current UI value
+            pass
 
     def _connect_db_now(self, project: ProjectModel) -> None:
         self._set_operation_running(True)
