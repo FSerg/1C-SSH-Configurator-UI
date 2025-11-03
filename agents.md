@@ -15,9 +15,12 @@
 
 Ключевые модули
 - `streamlit_app.py` — точка входа; вызывает `app.ui.run_app()`.
-- `app/ui.py` — Streamlit‑интерфейс, постановка операций в очередь, отображение логов, сборщики последовательностей команд.
-- `app/agent_client.py` — высокоуровневый клиент поверх SSH‑канала; потоковый парсер JSON‑сообщений от агента.
-- `app/ssh.py` — менеджер подключений Paramiko, управление shell‑каналом.
+- `app/ui.py` — Streamlit‑интерфейс, взаимодействие с HTTP API, отображение логов, управление состоянием подключений.
+- `app/api.py` — FastAPI HTTP API (порт 8000); эндпоинты для всех операций с агентом, управление подключениями к БД.
+- `app/agent_client.py` — высокоуровневый клиент поверх SSH‑канала; потоковый парсер JSON‑сообщений от агента; поддержка persistent-режима.
+- `app/ssh.py` — менеджер подключений Paramiko, управление shell‑каналом, idle-таймауты, переиспользование канала.
+- `app/session.py` — координация владения сессиями между UI и API процессами; предотвращение конфликтов.
+- `app/operations.py` — билдеры последовательностей команд для конфигурации, расширений, внешних файлов.
 - `app/models.py` — модели Pydantic (v1.x): креды, проект, опции запуска, сообщения.
 - `app/storage.py` — JSON‑хранилище проектов с обфускацией (через `app.utils`).
 - `app/utils.py` — обфускация секретов, нормализация путей, хелперы списков.
@@ -26,6 +29,8 @@
 Документация и запуск
 - `README.md` — запуск локально и в контейнере.
 - `docs/docs-1c-agent.md` — справка по командам/опциям 1C‑агента.
+- `docs/api.md` — документация HTTP API.
+- `md/release04-session.md` — подробное описание persistent-режима и управления сессиями.
 
 ---
 
@@ -34,8 +39,11 @@
 Локально
 - `python -m venv venv && source venv/bin/activate`
 - `pip install -r requirements.txt`
-- `streamlit run streamlit_app.py`
-- Необязательная переменная: `ONEC_AGENT_UI_SECRET_SALT` для своей соли обфускации.
+- Запуск API: `python start_services.py` (FastAPI на порту 8000, Streamlit на 8501)
+- Или раздельно: `uvicorn app.api:app --host 0.0.0.0 --port 8000` и `streamlit run streamlit_app.py`
+- Необязательные переменные:
+  - `ONEC_AGENT_UI_SECRET_SALT` для своей соли обфускации
+  - `ONEC_AGENT_API_BASE` для адреса API (по умолчанию `http://127.0.0.1:8000`)
 
 Docker
 - `docker build -t 1c-agent-ui .`
@@ -72,29 +80,51 @@ SSH/Агент
 - Только `SSHConnectionManager` (Paramiko) и `AgentClient` — не используйте внешние процессы/subprocess.
 - Держите инициализацию сессии в `AgentClient._initialize_session()` (JSON‑формат, прогресс, без приглашения).
 - Соблюдайте контракт `_JsonArrayParser`: парсинг верхнеуровневых JSON‑массивов, которые стримит агент.
+- Persistent-режим: при включенной опции `keep_db_connection` SSH-канал переиспользуется, подключение к БД сохраняется между операциями.
+- Idle-таймаут: SSH-канал автоматически закрывается при простое дольше `ssh_idle_timeout_seconds`.
+
+API и UI взаимодействие
+- UI выполняет операции через HTTP API (`app/api.py`), а не напрямую через `AgentClient`.
+- API работает на порту 8000, UI — на 8501.
+- Все эндпоинты используют persistent-режим для переиспользования SSH-соединений.
+- Глобальный словарь `_CONNECTION_STATE` в API отслеживает состояние подключений к БД по проектам.
+
+Управление сессиями
+- Модуль `app/session.py` координирует владение сессиями между UI и API процессами.
+- Runtime-файлы в `~/.1c-agent-ui/.runtime/owner-{uid}.json` для предотвращения конфликтов.
+- Проверка «живости» владельца по PID процесса (POSIX) или временным меткам (Windows).
 
 Состояние Streamlit
 - Используются ключи: `selected_project_uid`, `project_form_data`, `operation_in_progress`, `pending_operation`, `project_flash`, `last_operation_result`.
-- Операции ставятся в очередь `_queue_operation(...)`, фактический запуск — через `_maybe_execute_pending_operation(...)` в выбранной вкладке.
+- Дополнительно для persistent-режима: `db_connected__{uid}`, `db_connected_since__{uid}`, `agent_connected__{uid}`.
+- Операции ставятся в очередь `_queue_api_operation(...)`, фактический запуск — через HTTP API в `_run_api_operation(...)`.
 
 ---
 
 ## Как добавить новую операцию
 
-1) Сборщик последовательности в `app/ui.py`
-- Ориентируйтесь на `_build_dump_config_sequence`, `_build_load_config_sequence` и др.
-- Команды формируйте строками, которые принимает 1C‑агент. Для путей — `self._join_remote(base, name)`.
-- Для действий с конфигурацией используйте `_build_config_command(...)` — он корректно применяет флаги из `RunOptionsModel`.
+1) Сборщик последовательности в `app/operations.py`
+- Ориентируйтесь на `build_dump_config_sequence`, `build_load_config_sequence` и др.
+- Команды формируйте строками, которые принимает 1C‑агент. Для путей используйте нормализацию.
+- Для действий с конфигурацией используйте вспомогательные функции — они корректно применяют флаги из `RunOptionsModel`.
 
-2) Включение в вкладку
+2) Эндпоинт в API (`app/api.py`)
+- Добавьте GET-эндпоинт в соответствующий раздел (config, extensions, externals, tools, infobase).
+- Используйте `get_agent_client(project, persistent=True)` для получения клиента с переиспользованием SSH.
+- Передавайте логи через `_client_progress_logger(logs)`.
+- Выполняйте команды через `client.execute_sequence(commands, timeout_per_command=..., progress_cb=progress)`.
+- Возвращайте результат через `_json_logs_response(operation_name, logs, status)`.
+
+3) Включение в UI вкладку (`app/ui.py`)
 - Добавьте кнопку в нужной вкладке (`_render_configuration_tab`, `_render_extensions_tab`, `_render_externals_tab`, `_render_tools_tab`).
-- Вызывайте `_queue_operation(project, title, commands, scope=...)` с осмысленным заголовком и скоупом.
-- Запрещайте параллельные операции: проверяйте `_is_operation_running()` при активации кнопок.
+- Вызывайте `_queue_api_operation(project, title, api_path, params={}, scope=...)` с путем к API-эндпоинту.
+- Запрещайте параллельные операции: проверяйте `_is_operation_running()` при активации кнопок (`disabled=self._is_operation_running()`).
 
-3) Логи единообразно
-- Используйте прогресс‑колбэк из `AgentClient.execute_sequence`, формируйте строки через `_format_log_entry`.
+4) Логи единообразно
+- В API используйте прогресс‑колбэк из `AgentClient.execute_sequence`.
+- В UI логи приходят из API и отображаются через `_render_log_output()`.
 
-4) Тесты
+5) Тесты
 - Для чистых хелперов (строки, пути) добавляйте unit‑тесты в `tests/`.
 - Сетевые части не покрываем интеграционно; тестируйте билдеры и утилиты.
 
@@ -121,6 +151,10 @@ SSH/Агент
 - Один SSH‑shell‑канал на сессию; баннер читается один раз; при необходимости — реинициализация.
 - Финальные типы сообщений от агента: `success`, `error`, `cancel`. Таймаут выполнения на команду настраивается.
 - Жизненный цикл операции: очередь → выполнение (с опциональными connect/disconnect) → стрим логов → завершение → статус в сайдбаре.
+- Persistent-режим (при `keep_db_connection=True`):
+  - SSH-канал и подключение к БД сохраняются между операциями.
+  - Idle-таймаут автоматически закрывает SSH-канал при простое (по умолчанию 3600 сек).
+  - Координация владения сессией через `app/session.py` предотвращает конфликты между UI и API.
 
 ---
 
@@ -138,12 +172,21 @@ SSH/Агент
 
 Правки UI
 - Русские лейблы, без утечек секретов, сохранение ключей состояния.
-- Поток: `_queue_operation` → `_maybe_execute_pending_operation`.
+- Поток: `_queue_api_operation` → HTTP-запрос к API → `_run_api_operation` → обновление `last_operation_result`.
+- При работе с persistent-режимом обновляйте статусы через `_refresh_db_status_from_api()`.
+
+Правки API
+- Все операции через `get_agent_client(project, persistent=True)` для переиспользования SSH.
+- Управление подключением к БД: используйте команды `common connect-ib` / `common disconnect-ib`.
+- Обновляйте `_CONNECTION_STATE` при изменении состояния подключения к БД.
+- Возвращайте унифицированный JSON: `{"status": "success|error", "logs": [...], "operation": "..."}`.
 
 Правки хранилища
 - Обфускация чувствительных полей при сохранении, деобфускация при загрузке.
 - Стабильность UID; обновление меток времени через `ProjectModel.touch()`.
+- Новые поля в модели: добавляйте со значениями по умолчанию для обратной совместимости.
 
 Расширение команд агента
 - Инициализируйте сессию, если требуются новые режимы вывода.
 - Соблюдайте синтаксис 1C‑агента из `docs/docs-1c-agent.md`.
+- При persistent-режиме команды `connect-ib`/`disconnect-ib` управляют жизненным циклом подключения к БД.
